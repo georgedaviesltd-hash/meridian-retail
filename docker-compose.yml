@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: meridian-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${DB_NAME:-meridian_db}
+      POSTGRES_USER: ${DB_USER:-meridian}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-meridian}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  auth-service:
+    build: ./auth-service
+    container_name: meridian-auth
+    restart: always
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-meridian_db}
+      DB_USER: ${DB_USER:-meridian}
+      DB_PASSWORD: ${DB_PASSWORD:-meridian}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-env}
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      - postgres
+
+  catalog-service:
+    build: ./catalog-service
+    container_name: meridian-catalog
+    restart: always
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-meridian_db}
+      DB_USER: ${DB_USER:-meridian}
+      DB_PASSWORD: ${DB_PASSWORD:-meridian}
+    ports:
+      - "127.0.0.1:8002:4000"
+    depends_on:
+      - postgres
+
+  orders-service:
+    build: ./orders-service
+    container_name: meridian-orders
+    restart: always
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-meridian_db}
+      DB_USER: ${DB_USER:-meridian}
+      DB_PASSWORD: ${DB_PASSWORD:-meridian}
+    ports:
+      - "127.0.0.1:8003:8001"
+    depends_on:
+      - postgres
+
+  frontend:
+    build: ./frontend
+    container_name: meridian-frontend
+    restart: always
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres_data:
