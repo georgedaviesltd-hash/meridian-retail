@@ -1,0 +1,1612 @@
+=== FILE: ./auth-service/Dockerfile ===
+
+=== FILE: ./auth-service/main.py ===
+"""
+Meridian Retail Group — auth-service
+FastAPI service handling signup, login, and JWT issuance/verification.
+
+This service is PRE-BUILT for the assessment. Do not modify application
+logic — your job is the infrastructure around it (reverse proxy, TLS,
+backups, CI/CD), not the app code itself.
+
+Endpoints:
+    GET  /healthz              -> liveness check used by Nginx/monitoring
+    POST /api/auth/signup      -> create a user, returns a JWT
+    POST /api/auth/login       -> authenticate a user, returns a JWT
+    GET  /api/auth/verify      -> verify a JWT (used internally by orders-service)
+"""
+
+import os
+import time
+import uuid
+from datetime import datetime, timedelta
+
+import jwt
+import bcrypt
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, EmailStr
+
+app = FastAPI(title="auth-service")
+
+DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "meridian_db")
+DB_USER = os.getenv("DB_USER", "meridian")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "meridian")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-env")
+JWT_ALGO = "HS256"
+JWT_EXPIRY_MINUTES = int(os.getenv("JWT_EXPIRY_MINUTES", "60"))
+
+
+def get_conn():
+    for attempt in range(10):
+        try:
+            return psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASSWORD,
+            )
+        except psycopg2.OperationalError:
+            time.sleep(2)
+    raise RuntimeError("Could not connect to database after retries")
+
+
+def init_db():
+    conn = get_conn()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+    conn.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def make_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRY_MINUTES),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": "auth-service"}
+
+
+@app.post("/api/auth/signup")
+def signup(req: SignupRequest):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s", (req.email,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="Email already registered")
+
+            user_id = str(uuid.uuid4())
+            password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
+                (user_id, req.email, password_hash),
+            )
+        token = make_token(user_id, req.email)
+        return {"token": token, "user_id": user_id, "email": req.email}
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (req.email,))
+            row = cur.fetchone()
+        if not row or not bcrypt.checkpw(req.password.encode(), row["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = make_token(row["id"], req.email)
+        return {"token": token, "user_id": row["id"], "email": req.email}
+    finally:
+        conn.close()
+
+
+@app.get("/api/auth/verify")
+def verify(authorization: str = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return {"valid": True, "user_id": payload["sub"], "email": payload["email"]}
+
+=== FILE: ./auth-service/requirements.txt ===
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+psycopg2-binary==2.9.9
+pyjwt==2.8.0
+bcrypt==4.1.3
+pydantic[email]==2.7.1
+
+=== FILE: ./auth-service/tests/test_auth.py ===
+"""
+Basic smoke tests for auth-service.
+Run with: pytest tests/test_auth.py
+Requires a running Postgres reachable via the DB_* env vars.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+
+def test_healthz():
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_signup_and_login_flow():
+    email = "pytest-user@example.com"
+    password = "correct-horse-battery-staple"
+
+    # clean slate is assumed handled by test DB fixtures/CI setup
+    signup_resp = client.post("/api/auth/signup", json={"email": email, "password": password})
+    assert signup_resp.status_code in (200, 409)  # 409 if re-run against same DB
+
+    login_resp = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert login_resp.status_code == 200
+    assert "token" in login_resp.json()
+
+=== FILE: ./catalog-service/app.js ===
+/**
+ * Meridian Retail Group — catalog-service
+ * Express + node-postgres service serving the product catalog.
+ *
+ * This service is PRE-BUILT for the assessment. Do not modify application
+ * logic — your job is the infrastructure around it, not the app code.
+ *
+ * Endpoints:
+ *   GET /healthz              -> liveness check used by Nginx/monitoring
+ *   GET /api/catalog/products -> list all products (seeds itself on boot)
+ *   GET /api/catalog/products/:id -> fetch a single product
+ */
+
+const express = require("express");
+const { Pool } = require("pg");
+
+const app = express();
+app.use(express.json());
+
+const pool = new Pool({
+  host: process.env.DB_HOST || "postgres",
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || "meridian_db",
+  user: process.env.DB_USER || "meridian",
+  password: process.env.DB_PASSWORD || "meridian",
+});
+
+const SEED_PRODUCTS = [
+  { name: "Adire Wrap Dress", price: 45.0, category: "Womenswear" },
+  { name: "Aso-Oke Woven Tote", price: 32.5, category: "Accessories" },
+  { name: "Kente Trim Blazer", price: 89.0, category: "Menswear" },
+  { name: "Beaded Coral Necklace", price: 21.0, category: "Jewellery" },
+  { name: "Ankara Print Sneakers", price: 58.0, category: "Footwear" },
+];
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function initDb() {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS products (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          price NUMERIC(10, 2) NOT NULL,
+          category TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+      `);
+
+      const { rows } = await pool.query("SELECT COUNT(*) FROM products");
+      if (parseInt(rows[0].count, 10) === 0) {
+        for (const p of SEED_PRODUCTS) {
+          await pool.query(
+            "INSERT INTO products (name, price, category) VALUES ($1, $2, $3)",
+            [p.name, p.price, p.category]
+          );
+        }
+        console.log(`Seeded ${SEED_PRODUCTS.length} products`);
+      }
+      return;
+    } catch (err) {
+      console.log(`DB not ready (attempt ${attempt + 1}/10): ${err.message}`);
+      await sleep(2000);
+    }
+  }
+  throw new Error("Could not connect to database after retries");
+}
+
+app.get("/healthz", (req, res) => {
+  res.json({ status: "ok", service: "catalog-service" });
+});
+
+app.get("/api/catalog/products", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products ORDER BY id");
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch products" });
+  }
+});
+
+app.get("/api/catalog/products/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products WHERE id = $1", [
+      req.params.id,
+    ]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+const PORT = process.env.PORT || 4000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`catalog-service listening on ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("Fatal: could not initialise database", err);
+    process.exit(1);
+  });
+
+module.exports = app;
+
+=== FILE: ./catalog-service/Dockerfile ===
+
+=== FILE: ./catalog-service/package.json ===
+{
+  "name": "catalog-service",
+  "version": "1.0.0",
+  "description": "Meridian Retail Group product catalog service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}
+
+=== FILE: ./codebase_bundle.txt ===
+
+=== FILE: ./docker-compose.yml ===
+
+=== FILE: ./docs/backup-strategy.md ===
+
+=== FILE: ./docs/routing-explained.md ===
+
+=== FILE: ./frontend/Dockerfile ===
+
+=== FILE: ./frontend/index.html ===
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meridian Retail Group</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a2e; }
+  h1 { margin-bottom: 4px; }
+  .tagline { color: #666; margin-top: 0; }
+  section { border: 1px solid #e2e2e2; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  label { display: block; margin-top: 8px; font-size: 14px; }
+  input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+  button { margin-top: 12px; padding: 10px 16px; background: #16324f; color: white; border: none; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #0d1f30; }
+  #products { list-style: none; padding: 0; }
+  #products li { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+  .status { font-size: 13px; margin-top: 8px; }
+  .status.ok { color: #147a3b; }
+  .status.err { color: #b3261e; }
+  code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Meridian Retail Group</h1>
+<p class="tagline">African fashion &amp; lifestyle — curated, ethically-sourced.</p>
+
+<!-- Note: every fetch() below uses a RELATIVE path like /api/auth/signup.
+     No port numbers, no hardcoded host. The reverse proxy in front of
+     this page is responsible for routing each /api/* path to the
+     correct backend service. That's the entire point of this project. -->
+
+<section>
+  <h2>Sign Up</h2>
+  <label>Email <input type="email" id="signup-email" placeholder="you@example.com" /></label>
+  <label>Password <input type="password" id="signup-password" /></label>
+  <button onclick="signup()">Create Account</button>
+  <div id="signup-status" class="status"></div>
+</section>
+
+<section>
+  <h2>Log In</h2>
+  <label>Email <input type="email" id="login-email" placeholder="you@example.com" /></label>
+  <label>Password <input type="password" id="login-password" /></label>
+  <button onclick="login()">Log In</button>
+  <div id="login-status" class="status"></div>
+</section>
+
+<section>
+  <h2>Products</h2>
+  <button onclick="loadProducts()">Refresh Catalog</button>
+  <ul id="products"></ul>
+</section>
+
+<section>
+  <h2>Place an Order</h2>
+  <label>Product ID <input type="number" id="order-product-id" value="1" /></label>
+  <label>Quantity <input type="number" id="order-quantity" value="1" /></label>
+  <button onclick="placeOrder()">Place Order</button>
+  <div id="order-status" class="status"></div>
+</section>
+
+<script>
+let authToken = null;
+
+async function signup() {
+  const email = document.getElementById("signup-email").value;
+  const password = document.getElementById("signup-password").value;
+  const statusEl = document.getElementById("signup-status");
+  try {
+    const res = await fetch("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Signup failed");
+    authToken = data.token;
+    statusEl.textContent = `Account created. Token stored.`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+async function login() {
+  const email = document.getElementById("login-email").value;
+  const password = document.getElementById("login-password").value;
+  const statusEl = document.getElementById("login-status");
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Login failed");
+    authToken = data.token;
+    statusEl.textContent = `Logged in. Token stored.`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+async function loadProducts() {
+  const list = document.getElementById("products");
+  list.innerHTML = "<li>Loading…</li>";
+  try {
+    const res = await fetch("/api/catalog/products");
+    const products = await res.json();
+    list.innerHTML = "";
+    products.forEach((p) => {
+      const li = document.createElement("li");
+      li.innerHTML = `<span>#${p.id} — ${p.name} (${p.category})</span><strong>$${p.price}</strong>`;
+      list.appendChild(li);
+    });
+  } catch (err) {
+    list.innerHTML = `<li>Failed to load products: ${err.message}</li>`;
+  }
+}
+
+async function placeOrder() {
+  const productId = parseInt(document.getElementById("order-product-id").value, 10);
+  const quantity = parseInt(document.getElementById("order-quantity").value, 10);
+  const statusEl = document.getElementById("order-status");
+  if (!authToken) {
+    statusEl.textContent = "You must sign up or log in first.";
+    statusEl.className = "status err";
+    return;
+  }
+  try {
+    const res = await fetch("/api/orders", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ product_id: productId, quantity }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Order failed");
+    statusEl.textContent = `Order placed: ${data.quantity}x ${data.product} — total $${data.total_price}`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+loadProducts();
+</script>
+
+</body>
+</html>
+
+=== FILE: ./meridian-retail-main/auth-service/Dockerfile ===
+
+=== FILE: ./meridian-retail-main/auth-service/main.py ===
+"""
+Meridian Retail Group — auth-service
+FastAPI service handling signup, login, and JWT issuance/verification.
+
+This service is PRE-BUILT for the assessment. Do not modify application
+logic — your job is the infrastructure around it (reverse proxy, TLS,
+backups, CI/CD), not the app code itself.
+
+Endpoints:
+    GET  /healthz              -> liveness check used by Nginx/monitoring
+    POST /api/auth/signup      -> create a user, returns a JWT
+    POST /api/auth/login       -> authenticate a user, returns a JWT
+    GET  /api/auth/verify      -> verify a JWT (used internally by orders-service)
+"""
+
+import os
+import time
+import uuid
+from datetime import datetime, timedelta
+
+import jwt
+import bcrypt
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, EmailStr
+
+app = FastAPI(title="auth-service")
+
+DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "meridian_db")
+DB_USER = os.getenv("DB_USER", "meridian")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "meridian")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-env")
+JWT_ALGO = "HS256"
+JWT_EXPIRY_MINUTES = int(os.getenv("JWT_EXPIRY_MINUTES", "60"))
+
+
+def get_conn():
+    for attempt in range(10):
+        try:
+            return psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASSWORD,
+            )
+        except psycopg2.OperationalError:
+            time.sleep(2)
+    raise RuntimeError("Could not connect to database after retries")
+
+
+def init_db():
+    conn = get_conn()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+    conn.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def make_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRY_MINUTES),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": "auth-service"}
+
+
+@app.post("/api/auth/signup")
+def signup(req: SignupRequest):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s", (req.email,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="Email already registered")
+
+            user_id = str(uuid.uuid4())
+            password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
+                (user_id, req.email, password_hash),
+            )
+        token = make_token(user_id, req.email)
+        return {"token": token, "user_id": user_id, "email": req.email}
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (req.email,))
+            row = cur.fetchone()
+        if not row or not bcrypt.checkpw(req.password.encode(), row["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = make_token(row["id"], req.email)
+        return {"token": token, "user_id": row["id"], "email": req.email}
+    finally:
+        conn.close()
+
+
+@app.get("/api/auth/verify")
+def verify(authorization: str = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return {"valid": True, "user_id": payload["sub"], "email": payload["email"]}
+
+=== FILE: ./meridian-retail-main/auth-service/requirements.txt ===
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+psycopg2-binary==2.9.9
+pyjwt==2.8.0
+bcrypt==4.1.3
+pydantic[email]==2.7.1
+
+=== FILE: ./meridian-retail-main/auth-service/tests/test_auth.py ===
+"""
+Basic smoke tests for auth-service.
+Run with: pytest tests/test_auth.py
+Requires a running Postgres reachable via the DB_* env vars.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+
+def test_healthz():
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_signup_and_login_flow():
+    email = "pytest-user@example.com"
+    password = "correct-horse-battery-staple"
+
+    # clean slate is assumed handled by test DB fixtures/CI setup
+    signup_resp = client.post("/api/auth/signup", json={"email": email, "password": password})
+    assert signup_resp.status_code in (200, 409)  # 409 if re-run against same DB
+
+    login_resp = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert login_resp.status_code == 200
+    assert "token" in login_resp.json()
+
+=== FILE: ./meridian-retail-main/catalog-service/app.js ===
+/**
+ * Meridian Retail Group — catalog-service
+ * Express + node-postgres service serving the product catalog.
+ *
+ * This service is PRE-BUILT for the assessment. Do not modify application
+ * logic — your job is the infrastructure around it, not the app code.
+ *
+ * Endpoints:
+ *   GET /healthz              -> liveness check used by Nginx/monitoring
+ *   GET /api/catalog/products -> list all products (seeds itself on boot)
+ *   GET /api/catalog/products/:id -> fetch a single product
+ */
+
+const express = require("express");
+const { Pool } = require("pg");
+
+const app = express();
+app.use(express.json());
+
+const pool = new Pool({
+  host: process.env.DB_HOST || "postgres",
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || "meridian_db",
+  user: process.env.DB_USER || "meridian",
+  password: process.env.DB_PASSWORD || "meridian",
+});
+
+const SEED_PRODUCTS = [
+  { name: "Adire Wrap Dress", price: 45.0, category: "Womenswear" },
+  { name: "Aso-Oke Woven Tote", price: 32.5, category: "Accessories" },
+  { name: "Kente Trim Blazer", price: 89.0, category: "Menswear" },
+  { name: "Beaded Coral Necklace", price: 21.0, category: "Jewellery" },
+  { name: "Ankara Print Sneakers", price: 58.0, category: "Footwear" },
+];
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function initDb() {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS products (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          price NUMERIC(10, 2) NOT NULL,
+          category TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+      `);
+
+      const { rows } = await pool.query("SELECT COUNT(*) FROM products");
+      if (parseInt(rows[0].count, 10) === 0) {
+        for (const p of SEED_PRODUCTS) {
+          await pool.query(
+            "INSERT INTO products (name, price, category) VALUES ($1, $2, $3)",
+            [p.name, p.price, p.category]
+          );
+        }
+        console.log(`Seeded ${SEED_PRODUCTS.length} products`);
+      }
+      return;
+    } catch (err) {
+      console.log(`DB not ready (attempt ${attempt + 1}/10): ${err.message}`);
+      await sleep(2000);
+    }
+  }
+  throw new Error("Could not connect to database after retries");
+}
+
+app.get("/healthz", (req, res) => {
+  res.json({ status: "ok", service: "catalog-service" });
+});
+
+app.get("/api/catalog/products", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products ORDER BY id");
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch products" });
+  }
+});
+
+app.get("/api/catalog/products/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products WHERE id = $1", [
+      req.params.id,
+    ]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+const PORT = process.env.PORT || 4000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`catalog-service listening on ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("Fatal: could not initialise database", err);
+    process.exit(1);
+  });
+
+module.exports = app;
+
+=== FILE: ./meridian-retail-main/catalog-service/Dockerfile ===
+
+=== FILE: ./meridian-retail-main/catalog-service/package.json ===
+{
+  "name": "catalog-service",
+  "version": "1.0.0",
+  "description": "Meridian Retail Group product catalog service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}
+
+=== FILE: ./meridian-retail-main/docker-compose.yml ===
+
+=== FILE: ./meridian-retail-main/docs/backup-strategy.md ===
+
+=== FILE: ./meridian-retail-main/docs/routing-explained.md ===
+
+=== FILE: ./meridian-retail-main/frontend/Dockerfile ===
+
+=== FILE: ./meridian-retail-main/frontend/index.html ===
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meridian Retail Group</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a2e; }
+  h1 { margin-bottom: 4px; }
+  .tagline { color: #666; margin-top: 0; }
+  section { border: 1px solid #e2e2e2; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  label { display: block; margin-top: 8px; font-size: 14px; }
+  input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+  button { margin-top: 12px; padding: 10px 16px; background: #16324f; color: white; border: none; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #0d1f30; }
+  #products { list-style: none; padding: 0; }
+  #products li { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+  .status { font-size: 13px; margin-top: 8px; }
+  .status.ok { color: #147a3b; }
+  .status.err { color: #b3261e; }
+  code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Meridian Retail Group</h1>
+<p class="tagline">African fashion &amp; lifestyle — curated, ethically-sourced.</p>
+
+<!-- Note: every fetch() below uses a RELATIVE path like /api/auth/signup.
+     No port numbers, no hardcoded host. The reverse proxy in front of
+     this page is responsible for routing each /api/* path to the
+     correct backend service. That's the entire point of this project. -->
+
+<section>
+  <h2>Sign Up</h2>
+  <label>Email <input type="email" id="signup-email" placeholder="you@example.com" /></label>
+  <label>Password <input type="password" id="signup-password" /></label>
+  <button onclick="signup()">Create Account</button>
+  <div id="signup-status" class="status"></div>
+</section>
+
+<section>
+  <h2>Log In</h2>
+  <label>Email <input type="email" id="login-email" placeholder="you@example.com" /></label>
+  <label>Password <input type="password" id="login-password" /></label>
+  <button onclick="login()">Log In</button>
+  <div id="login-status" class="status"></div>
+</section>
+
+<section>
+  <h2>Products</h2>
+  <button onclick="loadProducts()">Refresh Catalog</button>
+  <ul id="products"></ul>
+</section>
+
+<section>
+  <h2>Place an Order</h2>
+  <label>Product ID <input type="number" id="order-product-id" value="1" /></label>
+  <label>Quantity <input type="number" id="order-quantity" value="1" /></label>
+  <button onclick="placeOrder()">Place Order</button>
+  <div id="order-status" class="status"></div>
+</section>
+
+<script>
+let authToken = null;
+
+async function signup() {
+  const email = document.getElementById("signup-email").value;
+  const password = document.getElementById("signup-password").value;
+  const statusEl = document.getElementById("signup-status");
+  try {
+    const res = await fetch("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Signup failed");
+    authToken = data.token;
+    statusEl.textContent = `Account created. Token stored.`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+async function login() {
+  const email = document.getElementById("login-email").value;
+  const password = document.getElementById("login-password").value;
+  const statusEl = document.getElementById("login-status");
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Login failed");
+    authToken = data.token;
+    statusEl.textContent = `Logged in. Token stored.`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+async function loadProducts() {
+  const list = document.getElementById("products");
+  list.innerHTML = "<li>Loading…</li>";
+  try {
+    const res = await fetch("/api/catalog/products");
+    const products = await res.json();
+    list.innerHTML = "";
+    products.forEach((p) => {
+      const li = document.createElement("li");
+      li.innerHTML = `<span>#${p.id} — ${p.name} (${p.category})</span><strong>$${p.price}</strong>`;
+      list.appendChild(li);
+    });
+  } catch (err) {
+    list.innerHTML = `<li>Failed to load products: ${err.message}</li>`;
+  }
+}
+
+async function placeOrder() {
+  const productId = parseInt(document.getElementById("order-product-id").value, 10);
+  const quantity = parseInt(document.getElementById("order-quantity").value, 10);
+  const statusEl = document.getElementById("order-status");
+  if (!authToken) {
+    statusEl.textContent = "You must sign up or log in first.";
+    statusEl.className = "status err";
+    return;
+  }
+  try {
+    const res = await fetch("/api/orders", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ product_id: productId, quantity }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Order failed");
+    statusEl.textContent = `Order placed: ${data.quantity}x ${data.product} — total $${data.total_price}`;
+    statusEl.className = "status ok";
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = "status err";
+  }
+}
+
+loadProducts();
+</script>
+
+</body>
+</html>
+
+=== FILE: ./meridian-retail-main/orders-service/Dockerfile ===
+
+=== FILE: ./meridian-retail-main/orders-service/main.py ===
+"""
+Meridian Retail Group — orders-service
+FastAPI service that places orders, calling auth-service (to verify the
+user's JWT) and catalog-service (to validate the product and price)
+over the internal Docker Compose network.
+
+This service is PRE-BUILT for the assessment. Do not modify application
+logic — your job is the infrastructure around it, not the app code.
+
+Endpoints:
+    GET  /healthz          -> liveness check used by Nginx/monitoring
+    POST /api/orders       -> place an order (requires Authorization: Bearer <jwt>)
+    GET  /api/orders       -> list orders for the authenticated user
+"""
+
+import os
+import time
+import uuid
+
+import httpx
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+
+app = FastAPI(title="orders-service")
+
+DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "meridian_db")
+DB_USER = os.getenv("DB_USER", "meridian")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "meridian")
+
+# Internal, container-to-container URLs (Docker Compose service names).
+# These are NOT the same as the host-mapped ports Nginx uses.
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8000")
+CATALOG_SERVICE_URL = os.getenv("CATALOG_SERVICE_URL", "http://catalog-service:4000")
+
+
+def get_conn():
+    for attempt in range(10):
+        try:
+            return psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASSWORD,
+            )
+        except psycopg2.OperationalError:
+            time.sleep(2)
+    raise RuntimeError("Could not connect to database after retries")
+
+
+def init_db():
+    conn = get_conn()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id UUID PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                total_price NUMERIC(10, 2) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+    conn.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+class OrderRequest(BaseModel):
+    product_id: int
+    quantity: int = 1
+
+
+def verify_token(authorization: str) -> dict:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    try:
+        resp = httpx.get(
+            f"{AUTH_SERVICE_URL}/api/auth/verify",
+            headers={"Authorization": authorization},
+            timeout=5.0,
+        )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="auth-service unreachable")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return resp.json()
+
+
+def fetch_product(product_id: int) -> dict:
+    try:
+        resp = httpx.get(
+            f"{CATALOG_SERVICE_URL}/api/catalog/products/{product_id}", timeout=5.0
+        )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="catalog-service unreachable")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="catalog-service error")
+    return resp.json()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": "orders-service"}
+
+
+@app.post("/api/orders")
+def place_order(order: OrderRequest, authorization: str = Header(default=None)):
+    user = verify_token(authorization)
+    product = fetch_product(order.product_id)
+
+    total_price = float(product["price"]) * order.quantity
+    order_id = str(uuid.uuid4())
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (id, user_id, product_id, quantity, total_price)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (order_id, user["user_id"], order.product_id, order.quantity, total_price),
+            )
+    finally:
+        conn.close()
+
+    return {
+        "order_id": order_id,
+        "product": product["name"],
+        "quantity": order.quantity,
+        "total_price": total_price,
+    }
+
+
+@app.get("/api/orders")
+def list_orders(authorization: str = Header(default=None)):
+    user = verify_token(authorization)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM orders WHERE user_id = %s ORDER BY created_at DESC",
+                (user["user_id"],),
+            )
+            rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
+
+=== FILE: ./meridian-retail-main/orders-service/requirements.txt ===
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+psycopg2-binary==2.9.9
+httpx==0.27.0
+pydantic==2.7.1
+
+=== FILE: ./meridian-retail-main/README.md ===
+# Meridian Retail Group — Reverse Proxy, Domains, TLS & Multi-Service Foundations
+
+This repository contains the pre-built Meridian Retail Group application
+(three backend services, a frontend, and a Postgres database) used in the
+DevOps Foundations internship project.
+
+## What's already built (do not modify)
+
+- `auth-service/main.py` — FastAPI signup/login/JWT service
+- `catalog-service/app.js` — Express + Postgres product catalog service
+- `orders-service/main.py` — FastAPI orders service (calls auth-service + catalog-service)
+- `frontend/index.html` — static storefront (calls relative `/api/*` paths)
+- `requirements.txt` / `package.json` — dependencies for each service
+
+## What you need to build
+
+The following files exist but are **empty** — you're building these from
+scratch, with no starter code or hints:
+
+- `auth-service/Dockerfile`
+- `catalog-service/Dockerfile`
+- `orders-service/Dockerfile`
+- `frontend/Dockerfile`
+- `docker-compose.yml` — wire all four services + Postgres together
+- `scripts/server_setup.sh` — bootstrap a fresh EC2 instance (Docker, Nginx, Certbot)
+- `nginx/meridian-http.conf` — your hand-written reverse proxy config
+- `nginx/meridian-https-reference.conf` — filled in after running Certbot
+- `scripts/backup_db.sh` — automated daily Postgres backup
+- `scripts/restore_db.sh` — restore from a backup and prove it works
+- `.github/workflows/ci.yml` — build + test on every push
+- `.github/workflows/deploy.yml` — build, push to ECR, deploy on push to main
+- `docs/routing-explained.md` — written explanation of your Nginx config
+- `docs/backup-strategy.md` — written explanation of your backup approach
+
+See the full project brief (provided separately) for the two-week schedule,
+all ten deliverables (D1–D10), and the pre/post-assessment questions.
+
+## Getting started locally
+
+```bash
+cp .env.example .env
+# edit .env with real values (DB password, JWT secret, etc.)
+
+# You'll need to write docker-compose.yml and each service's Dockerfile
+# before this works:
+docker compose up -d --build
+docker compose ps          # all five containers should be Up
+curl http://localhost:8080 # should return the storefront HTML
+```
+
+## Service ports (local/dev)
+
+| Service          | Container Port | Host Port (127.0.0.1 only) |
+|------------------|-----------------|------------------------------|
+| auth-service     | 8000            | 8001                         |
+| catalog-service  | 4000            | 8002                         |
+| orders-service   | 8001            | 8003                         |
+| frontend         | 80              | 8080 (public, temporary)     |
+| postgres         | 5432            | 5432                         |
+
+Once your reverse proxy is in place, the frontend's public port exposure
+should be reconsidered — customers should reach everything through your
+domain and Nginx, not a raw `:8080`.
+
+## New Concepts Reference Table
+
+| Concept | Description | Status |
+|---|---|---|
+| Terraform & VPC | Automating custom network isolation, subnets, and server provisioning via code. | New to this project |
+| IAM Instance Profile | Securely attaching scoped permissions directly to a server instead of using keys. | New to this project |
+| Immutable ECR | Secure container registries that prevent overwriting existing image tags. | New to this project |
+| Dynamic Security Groups | Modifying AWS firewall rules through CI/CD to whitelist runner IPs. | New to this project |
+| Reverse Proxy | A server that sits in front of backend services and forwards client requests. | New to this project |
+| `proxy_pass` directive | The Nginx directive that forwards a matched request to a backend address. | New to this project |
+| DNS A record | A DNS record that maps a domain name to an IPv4 address. | New to this project |
+| TLS / HTTPS (Certbot) | Encrypting traffic between the browser and the server. | New to this project |
+| Docker Compose networking | Containers reaching each other by service name internally. | Existing knowledge |
+
+## What You Will Build
+
+The project has ten deliverables. Each deliverable has a specific,
+observable verification. D9, the tested restore, and D10, the automated
+deployment, most clearly distinguish this project from a tutorial because
+both require proving that the system works end to end securely.
+
+| Ref | Deliverable | Verification |
+|---|---|---|
+| D1 | Custom VPC and EC2 provisioned via Terraform | `terraform output` shows the VPC ID and EC2 public IP. The server runs Ubuntu 22.04. |
+| D2 | Security group IP whitelisting | AWS Console confirms that port 22 is restricted exclusively to the intern's specific IP address. |
+| D3 | Immutable ECR repositories | AWS Console shows ECR repositories for auth, catalog, orders, and frontend with mutability set to `IMMUTABLE`. |
+| D4 | Least-privilege IAM role | `terraform state list` shows an `aws_iam_role` attached to the EC2 instance, allowing read-only access to ECR. |
+| D5 | DuckDNS routing active | `dig yourdomain.duckdns.org +short` resolves exactly to the EC2 instance's public IP. |
+| D6 | Manual Nginx routing correctly configured | `curl http://yourdomain.duckdns.org/api/auth/healthz` returns `200 OK` from the auth container. |
+| D7 | HTTPS active and redirecting | `curl -I https://yourdomain.duckdns.org` returns HTTP 200 without a certificate warning. The browser padlock is confirmed. |
+| D8 | Database deployed and secured | PostgreSQL runs in Docker Compose, its port is bound to `127.0.0.1` on the host, and it is seeded with sample data. |
+| D9 | Backup restore tested | Drop a test row, restore from the backup using `scripts/restore_db.sh`, and confirm that the row reappears. |
+| D10 | CI/CD pipeline automation | Pushing to `main` triggers GitHub Actions to build images, push them to ECR, dynamically update the EC2 security group for the runner IP, connect through SSH, and run `docker compose up -d`. |
+
+## Repository and File Structure
+
+The repository contains the full pre-built application as well as the
+infrastructure work: Terraform configuration, Nginx configuration, backup
+scripts, and CI/CD workflows.
+
+```text
+meridian-retail/
+├── terraform/
+│   ├── main.tf              # VPC, EC2, IAM, and ECR infrastructure
+│   ├── variables.tf         # Region, personal IP, and other variables
+│   └── outputs.tf            # EC2 public IP and VPC IDs
+├── auth-service/
+│   ├── main.py              # Signup, login, and JWT issuance
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── tests/test_auth.py
+├── catalog-service/
+│   ├── app.js               # Express + Postgres product listings
+│   ├── package.json
+│   └── Dockerfile
+├── orders-service/
+│   ├── main.py              # Calls auth-service and catalog-service
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── index.html           # Storefront UI; calls /api/* on the same domain
+│   └── Dockerfile
+├── nginx/
+│   ├── meridian-http.conf   # Phase 1: hand-written HTTP routing config
+│   └── meridian-https-reference.conf # Phase 2: Certbot-generated reference
+├── scripts/
+│   ├── backup_db.sh         # Create PostgreSQL backups
+│   ├── restore_db.sh        # Restore PostgreSQL backups
+│   ├── server_setup.sh      # Bootstrap Docker, Nginx, and Certbot
+│   └── ...
+├── .github/workflows/
+│   ├── ci.yml               # Build and test on every push
+│   └── deploy.yml           # Build, publish, and deploy to EC2
+├── docker-compose.yml
+└── README.md
+```
+
+
+=== FILE: ./meridian-retail-main/scripts/backup_db.sh ===
+
+=== FILE: ./meridian-retail-main/scripts/restore_db.sh ===
+
+=== FILE: ./meridian-retail-main/scripts/server_setup.sh ===
+
+=== FILE: ./orders-service/Dockerfile ===
+
+=== FILE: ./orders-service/main.py ===
+"""
+Meridian Retail Group — orders-service
+FastAPI service that places orders, calling auth-service (to verify the
+user's JWT) and catalog-service (to validate the product and price)
+over the internal Docker Compose network.
+
+This service is PRE-BUILT for the assessment. Do not modify application
+logic — your job is the infrastructure around it, not the app code.
+
+Endpoints:
+    GET  /healthz          -> liveness check used by Nginx/monitoring
+    POST /api/orders       -> place an order (requires Authorization: Bearer <jwt>)
+    GET  /api/orders       -> list orders for the authenticated user
+"""
+
+import os
+import time
+import uuid
+
+import httpx
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+
+app = FastAPI(title="orders-service")
+
+DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "meridian_db")
+DB_USER = os.getenv("DB_USER", "meridian")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "meridian")
+
+# Internal, container-to-container URLs (Docker Compose service names).
+# These are NOT the same as the host-mapped ports Nginx uses.
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8000")
+CATALOG_SERVICE_URL = os.getenv("CATALOG_SERVICE_URL", "http://catalog-service:4000")
+
+
+def get_conn():
+    for attempt in range(10):
+        try:
+            return psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+                user=DB_USER, password=DB_PASSWORD,
+            )
+        except psycopg2.OperationalError:
+            time.sleep(2)
+    raise RuntimeError("Could not connect to database after retries")
+
+
+def init_db():
+    conn = get_conn()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id UUID PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                total_price NUMERIC(10, 2) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+    conn.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+class OrderRequest(BaseModel):
+    product_id: int
+    quantity: int = 1
+
+
+def verify_token(authorization: str) -> dict:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    try:
+        resp = httpx.get(
+            f"{AUTH_SERVICE_URL}/api/auth/verify",
+            headers={"Authorization": authorization},
+            timeout=5.0,
+        )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="auth-service unreachable")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return resp.json()
+
+
+def fetch_product(product_id: int) -> dict:
+    try:
+        resp = httpx.get(
+            f"{CATALOG_SERVICE_URL}/api/catalog/products/{product_id}", timeout=5.0
+        )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="catalog-service unreachable")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="catalog-service error")
+    return resp.json()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": "orders-service"}
+
+
+@app.post("/api/orders")
+def place_order(order: OrderRequest, authorization: str = Header(default=None)):
+    user = verify_token(authorization)
+    product = fetch_product(order.product_id)
+
+    total_price = float(product["price"]) * order.quantity
+    order_id = str(uuid.uuid4())
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO orders (id, user_id, product_id, quantity, total_price)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (order_id, user["user_id"], order.product_id, order.quantity, total_price),
+            )
+    finally:
+        conn.close()
+
+    return {
+        "order_id": order_id,
+        "product": product["name"],
+        "quantity": order.quantity,
+        "total_price": total_price,
+    }
+
+
+@app.get("/api/orders")
+def list_orders(authorization: str = Header(default=None)):
+    user = verify_token(authorization)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM orders WHERE user_id = %s ORDER BY created_at DESC",
+                (user["user_id"],),
+            )
+            rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
+
+=== FILE: ./orders-service/requirements.txt ===
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+psycopg2-binary==2.9.9
+httpx==0.27.0
+pydantic==2.7.1
+
+=== FILE: ./README.md ===
+# Meridian Retail Group — Reverse Proxy, Domains, TLS & Multi-Service Foundations
+
+This repository contains the pre-built Meridian Retail Group application
+(three backend services, a frontend, and a Postgres database) used in the
+DevOps Foundations internship project.
+
+## What's already built (do not modify)
+
+- `auth-service/main.py` — FastAPI signup/login/JWT service
+- `catalog-service/app.js` — Express + Postgres product catalog service
+- `orders-service/main.py` — FastAPI orders service (calls auth-service + catalog-service)
+- `frontend/index.html` — static storefront (calls relative `/api/*` paths)
+- `requirements.txt` / `package.json` — dependencies for each service
+
+## What you need to build
+
+The following files exist but are **empty** — you're building these from
+scratch, with no starter code or hints:
+
+- `auth-service/Dockerfile`
+- `catalog-service/Dockerfile`
+- `orders-service/Dockerfile`
+- `frontend/Dockerfile`
+- `docker-compose.yml` — wire all four services + Postgres together
+- `scripts/server_setup.sh` — bootstrap a fresh EC2 instance (Docker, Nginx, Certbot)
+- `nginx/meridian-http.conf` — your hand-written reverse proxy config
+- `nginx/meridian-https-reference.conf` — filled in after running Certbot
+- `scripts/backup_db.sh` — automated daily Postgres backup
+- `scripts/restore_db.sh` — restore from a backup and prove it works
+- `.github/workflows/ci.yml` — build + test on every push
+- `.github/workflows/deploy.yml` — build, push to ECR, deploy on push to main
+- `docs/routing-explained.md` — written explanation of your Nginx config
+- `docs/backup-strategy.md` — written explanation of your backup approach
+
+See the full project brief (provided separately) for the two-week schedule,
+all ten deliverables (D1–D10), and the pre/post-assessment questions.
+
+## Getting started locally
+
+```bash
+cp .env.example .env
+# edit .env with real values (DB password, JWT secret, etc.)
+
+# You'll need to write docker-compose.yml and each service's Dockerfile
+# before this works:
+docker compose up -d --build
+docker compose ps          # all five containers should be Up
+curl http://localhost:8080 # should return the storefront HTML
+```
+
+## Service ports (local/dev)
+
+| Service          | Container Port | Host Port (127.0.0.1 only) |
+|------------------|-----------------|------------------------------|
+| auth-service     | 8000            | 8001                         |
+| catalog-service  | 4000            | 8002                         |
+| orders-service   | 8001            | 8003                         |
+| frontend         | 80              | 8080 (public, temporary)     |
+| postgres         | 5432            | 5432                         |
+
+Once your reverse proxy is in place, the frontend's public port exposure
+should be reconsidered — customers should reach everything through your
+domain and Nginx, not a raw `:8080`.
+
+## New Concepts Reference Table
+
+| Concept | Description | Status |
+|---|---|---|
+| Terraform & VPC | Automating custom network isolation, subnets, and server provisioning via code. | New to this project |
+| IAM Instance Profile | Securely attaching scoped permissions directly to a server instead of using keys. | New to this project |
+| Immutable ECR | Secure container registries that prevent overwriting existing image tags. | New to this project |
+| Dynamic Security Groups | Modifying AWS firewall rules through CI/CD to whitelist runner IPs. | New to this project |
+| Reverse Proxy | A server that sits in front of backend services and forwards client requests. | New to this project |
+| `proxy_pass` directive | The Nginx directive that forwards a matched request to a backend address. | New to this project |
+| DNS A record | A DNS record that maps a domain name to an IPv4 address. | New to this project |
+| TLS / HTTPS (Certbot) | Encrypting traffic between the browser and the server. | New to this project |
+| Docker Compose networking | Containers reaching each other by service name internally. | Existing knowledge |
+
+## What You Will Build
+
+The project has ten deliverables. Each deliverable has a specific,
+observable verification. D9, the tested restore, and D10, the automated
+deployment, most clearly distinguish this project from a tutorial because
+both require proving that the system works end to end securely.
+
+| Ref | Deliverable | Verification |
+|---|---|---|
+| D1 | Custom VPC and EC2 provisioned via Terraform | `terraform output` shows the VPC ID and EC2 public IP. The server runs Ubuntu 22.04. |
+| D2 | Security group IP whitelisting | AWS Console confirms that port 22 is restricted exclusively to the intern's specific IP address. |
+| D3 | Immutable ECR repositories | AWS Console shows ECR repositories for auth, catalog, orders, and frontend with mutability set to `IMMUTABLE`. |
+| D4 | Least-privilege IAM role | `terraform state list` shows an `aws_iam_role` attached to the EC2 instance, allowing read-only access to ECR. |
+| D5 | DuckDNS routing active | `dig yourdomain.duckdns.org +short` resolves exactly to the EC2 instance's public IP. |
+| D6 | Manual Nginx routing correctly configured | `curl http://yourdomain.duckdns.org/api/auth/healthz` returns `200 OK` from the auth container. |
+| D7 | HTTPS active and redirecting | `curl -I https://yourdomain.duckdns.org` returns HTTP 200 without a certificate warning. The browser padlock is confirmed. |
+| D8 | Database deployed and secured | PostgreSQL runs in Docker Compose, its port is bound to `127.0.0.1` on the host, and it is seeded with sample data. |
+| D9 | Backup restore tested | Drop a test row, restore from the backup using `scripts/restore_db.sh`, and confirm that the row reappears. |
+| D10 | CI/CD pipeline automation | Pushing to `main` triggers GitHub Actions to build images, push them to ECR, dynamically update the EC2 security group for the runner IP, connect through SSH, and run `docker compose up -d`. |
+
+## Repository and File Structure
+
+The repository contains the full pre-built application as well as the
+infrastructure work: Terraform configuration, Nginx configuration, backup
+scripts, and CI/CD workflows.
+
+```text
+meridian-retail/
+├── terraform/
+│   ├── main.tf              # VPC, EC2, IAM, and ECR infrastructure
+│   ├── variables.tf         # Region, personal IP, and other variables
+│   └── outputs.tf            # EC2 public IP and VPC IDs
+├── auth-service/
+│   ├── main.py              # Signup, login, and JWT issuance
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── tests/test_auth.py
+├── catalog-service/
+│   ├── app.js               # Express + Postgres product listings
+│   ├── package.json
+│   └── Dockerfile
+├── orders-service/
+│   ├── main.py              # Calls auth-service and catalog-service
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── index.html           # Storefront UI; calls /api/* on the same domain
+│   └── Dockerfile
+├── nginx/
+│   ├── meridian-http.conf   # Phase 1: hand-written HTTP routing config
+│   └── meridian-https-reference.conf # Phase 2: Certbot-generated reference
+├── scripts/
+│   ├── backup_db.sh         # Create PostgreSQL backups
+│   ├── restore_db.sh        # Restore PostgreSQL backups
+│   ├── server_setup.sh      # Bootstrap Docker, Nginx, and Certbot
+│   └── ...
+├── .github/workflows/
+│   ├── ci.yml               # Build and test on every push
+│   └── deploy.yml           # Build, publish, and deploy to EC2
+├── docker-compose.yml
+└── README.md
+```
+
+
+=== FILE: ./scripts/backup_db.sh ===
+
+=== FILE: ./scripts/restore_db.sh ===
+
+=== FILE: ./scripts/server_setup.sh ===
+
